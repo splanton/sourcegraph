@@ -552,7 +552,9 @@ func (r *searchResolver) logSearchLatency(ctx context.Context, durationMs int32)
 	}
 }
 
-func (r *searchResolver) Results(ctx context.Context) (*SearchResultsResolver, error) {
+// evaluateLeaf performs a single search operation and corresponds to the
+// evaluation of leaf expression in a query.
+func (r *searchResolver) evaluateLeaf(ctx context.Context) (*SearchResultsResolver, error) {
 	// If the request is a paginated one, we handle it separately. See
 	// paginatedResults for more details.
 	if r.pagination != nil {
@@ -584,6 +586,108 @@ func (r *searchResolver) Results(ctx context.Context) (*SearchResultsResolver, e
 	searchResponseCounter.WithLabelValues(status, alertType).Inc()
 
 	return rr, err
+}
+
+// isPatternExpression returns true if every leaf node in a tree root at node is
+// a search pattern.
+func isPatternExpression(node query.Node) bool {
+	result := true
+	query.VisitParameter([]query.Node{node}, func(field, _ string, _ bool) {
+		if field != "" && field != "content" {
+			result = false
+		}
+	})
+	return result
+}
+
+// isPatternExpression returns true if every leaf node in a tree root at node is
+// a search pattern.
+func isAndExpression(node query.Node) bool {
+	result := true
+	query.VisitParameter([]query.Node{node}, func(field, _ string, _ bool) {
+		if field != "" && field != "content" {
+			result = false
+		}
+	})
+	return result
+}
+
+// getTopLevelNodes returns the top level query to process. It validates that we
+// can process the query with respect to and/or expressions on file content, but
+// not otherwise for nested parameters.
+func getTopLevelNodes(nodes []query.Node) ([]query.Node, error) {
+	if len(nodes) == 1 {
+		if term, ok := nodes[0].(query.Operator); ok {
+			if term.Kind == query.And && isPatternExpression(term) {
+				return nodes, nil
+			} else if term.Kind == query.Or && isPatternExpression(term) {
+				return nodes, nil
+			} else if term.Kind == query.And {
+				return term.Operands, nil
+			} else if term.Kind == query.Concat {
+				return nodes, nil
+			} else {
+				return nil, errors.New("cannot evaluate: unable to partition pure search pattern")
+			}
+		}
+	}
+	return nodes, nil
+}
+
+// partitionSearchPattern partitions an and/or query into a (1) single search
+// pattern expression and (2) other parameters that scope the evaluation of
+// search patterns (e.g., to repos, files, etc.). It validates that a query
+// contains at most one search pattern expression and that scope parameters do
+// not contain nested expressions.
+func partitionSearchPattern(nodes []query.Node) (parameters []query.Node, pattern query.Node, err error) {
+	nodes, err = getTopLevelNodes(nodes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var patterns []query.Node
+	for _, node := range nodes {
+		if isPatternExpression(node) {
+			patterns = append(patterns, node)
+		} else if term, ok := node.(query.Parameter); ok {
+			parameters = append(parameters, term)
+		} else {
+			return nil, nil, errors.New("cannot evaluate: unable to partition pure search pattern")
+		}
+	}
+	if len(patterns) > 1 {
+		pattern = query.Operator{Kind: query.And, Operands: patterns}
+	} else if len(patterns) == 1 {
+		pattern = patterns[0]
+	}
+
+	return parameters, pattern, nil
+}
+
+// evaluate evaluates all expressions of a search query.
+func (r *searchResolver) evaluate(ctx context.Context, q []query.Node) (*SearchResultsResolver, error) {
+	scopeParameters, pattern, err := partitionSearchPattern(q)
+	if err != nil {
+		return nil, err
+	}
+
+	validatedQuery := scopeParameters
+	if pattern != nil {
+		validatedQuery = append(scopeParameters, pattern)
+	}
+	r.query = query.AndOrQuery{Query: validatedQuery}
+	return r.evaluateLeaf(ctx)
+}
+
+func (r *searchResolver) Results(ctx context.Context) (*SearchResultsResolver, error) {
+	switch q := r.query.(type) {
+	case *query.OrdinaryQuery:
+		return r.evaluateLeaf(ctx)
+	case *query.AndOrQuery:
+		return r.evaluate(ctx, q.Query)
+	}
+	// Unreachable, matching is exhaustive.
+	return nil, nil
 }
 
 // resultsWithTimeoutSuggestion calls doResults, and in case of deadline

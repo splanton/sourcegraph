@@ -1433,3 +1433,120 @@ func Test_SearchResultsResolver_ApproximateResultCount(t *testing.T) {
 		})
 	}
 }
+
+func Test_partitionSearchPattern(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: "x",
+			want:  "x",
+		},
+		{
+			input: "x y",
+			want:  "(concat x y)",
+		},
+		{
+			input: "x or y",
+			want:  "(or x y)",
+		},
+		{
+			input: "x and y",
+			want:  "(and x y)",
+		},
+		{
+			input: "file:foo x y",
+			want:  "file:foo (concat x y)",
+		},
+		{
+			input: "file:foo (x y)",
+			want:  "file:foo (concat x y)",
+		},
+		{
+			input: "(file:foo x) y",
+			want:  "cannot evaluate: unable to partition pure search pattern",
+		},
+		{
+			input: "file:foo (x and y)",
+			want:  "file:foo (and x y)",
+		},
+		{
+			input: "(file:foo x) and y", // Yuck, invalidate.
+			want:  "file:foo (and x y)",
+		},
+		{
+			input: "file:foo x and y",
+			want:  "file:foo (and x y)",
+		},
+		{
+			input: "file:foo (x or y)",
+			want:  "file:foo (or x y)",
+		},
+		{
+			input: "(file:foo x) or y",
+			want:  "cannot evaluate: unable to partition pure search pattern",
+		},
+		{
+			input: "file:foo x or y",
+			want:  "cannot evaluate: unable to partition pure search pattern",
+		},
+		{
+			input: "file:foo and content:x",
+			want:  "file:foo content:x",
+		},
+		{
+			input: "repo:foo and file:bar and x",
+			want:  "repo:foo file:bar x",
+		},
+		{
+			input: "repo:foo and (file:bar or file:baz) and x",
+			want:  "cannot evaluate: unable to partition pure search pattern",
+		},
+		/*
+			{
+				// FIXME: invalidate this
+				input: "z file:foo (x or y)",
+				want:  "file:foo (concat z (or x y))",
+			},
+			{
+			// FIXME should it pass? It's weird to make this pass but not 'or', but making this not pass means we have to distinguish between <space> and <and> depending on operand expressions.
+				input: "file:foo x and y",
+				want:  "",
+			},
+			{
+				// FIXME: decide here.
+				input: "z and file:foo x and y",
+				want:  "",
+			},
+			{
+				// FIXME should pass.
+				input: "file:foo (x and y)",
+				want:  "",
+			},
+
+		*/
+	}
+	for _, tt := range cases {
+		t.Run("partition search pattern", func(t *testing.T) {
+			q, _ := query.ParseAndOr(tt.input)
+			andOrQuery, _ := q.(*query.AndOrQuery)
+			scopeParameters, pattern, err := partitionSearchPattern(andOrQuery.Query)
+			if err != nil {
+				if diff := cmp.Diff(tt.want, err.Error()); diff != "" {
+					t.Fatal(diff)
+				}
+				return
+			}
+			result := append(scopeParameters, pattern)
+			var resultStr []string
+			for _, node := range result {
+				resultStr = append(resultStr, node.String())
+			}
+			got := strings.Join(resultStr, " ")
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Error(diff)
+			}
+		})
+	}
+}
