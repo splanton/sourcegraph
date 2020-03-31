@@ -800,7 +800,7 @@ func TestSearchRevspecs(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.descr, func(t *testing.T) {
-			pats, err := findPatternRevs(test.specs)
+			_, pats, err := partitionPatternRevs(test.specs)
 			if err != nil {
 				if test.err == nil {
 					t.Errorf("unexpected error: '%s'", err)

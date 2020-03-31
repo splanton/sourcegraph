@@ -416,27 +416,30 @@ func getRevsForMatchedRepo(repo api.RepoName, pats []patternRevspec) (matched []
 // findPatternRevs mutates the given list of include patterns to
 // be a raw list of the repository name patterns we want, separating
 // out their revision specs, if any.
-func findPatternRevs(includePatterns []string) (includePatternRevs []patternRevspec, err error) {
-	includePatternRevs = make([]patternRevspec, 0, len(includePatterns))
+func partitionPatternRevs(includePatterns []string) ([]string, []patternRevspec, error) {
+	strippedIncludePatterns := make([]string, len(includePatterns))
+	copy(strippedIncludePatterns, includePatterns)
+	includePatternRevs := make([]patternRevspec, 0, len(includePatterns))
 	for i, includePattern := range includePatterns {
 		repoPattern, revs := search.ParseRepositoryRevisions(includePattern)
 		// Validate pattern now so the error message is more recognizable to the
 		// user
 		if _, err := regexp.Compile(string(repoPattern)); err != nil {
-			return nil, &badRequestError{err}
+			return strippedIncludePatterns, nil, &badRequestError{err}
 		}
 		repoPattern = api.RepoName(optimizeRepoPatternWithHeuristics(string(repoPattern)))
-		includePatterns[i] = string(repoPattern)
+		strippedIncludePatterns[i] = string(repoPattern)
 		if len(revs) > 0 {
-			p, err := regexp.Compile("(?i:" + includePatterns[i] + ")")
+			p, err := regexp.Compile("(?i:" + strippedIncludePatterns[i] + ")")
 			if err != nil {
-				return nil, &badRequestError{err}
+				return strippedIncludePatterns, nil, &badRequestError{err}
 			}
 			patternRev := patternRevspec{includePattern: p, revs: revs}
 			includePatternRevs = append(includePatternRevs, patternRev)
 		}
 	}
-	return
+	log15.Info("X.", "includePatterns", includePatterns, "strippedIncludePatterns", strippedIncludePatterns)
+	return strippedIncludePatterns, includePatternRevs, nil
 }
 
 type resolveRepoOp struct {
@@ -448,6 +451,50 @@ type resolveRepoOp struct {
 	noArchived       bool
 	onlyArchived     bool
 	commitAfter      string
+}
+
+var re = lazyregexp.New(`@[0-9a-zA-Z-_.:\/]+`)
+
+// strips @commit part of a list of strings.
+func stripAtRevspec(in []string) (result []string) {
+	for _, s := range in {
+		result = append(result, re.ReplaceAllString(s, ""))
+	}
+	return result
+}
+
+// parseMutliRepoSpec parses a particular regex expression that allows to search
+// across different repositories and different revisions. It expects the following form:
+//
+// repo => ^github.com/user/repo@commit
+// expression => repo|repo|repo...
+func parseMultiRepoSpec(includePatterns []string) ([]string, bool) {
+	if len(includePatterns) == 0 {
+		return includePatterns, false
+	}
+	if len(includePatterns) > 1 {
+		return nil, false
+	}
+	repos := strings.Split(includePatterns[0], "|")
+	// validate each repo conforms to "^repo$@alphanum-".
+	validated := true
+	// strip out "@..." suffix in "^repo$" to validate anchors and that these are all literal patterns.
+	strippedRepos := stripAtRevspec(repos)
+	for _, repo := range strippedRepos {
+		if strings.HasPrefix(repo, "^") && strings.HasSuffix(repo, "$") {
+			strippedRepo := strings.TrimSuffix(strings.TrimPrefix(repo, "^"), "$")
+			regexpRepoPattern, err := regexpsyntax.Parse(strippedRepo, regexpFlags)
+			if err != nil {
+				return nil, false
+			}
+			validated = validated && (regexpRepoPattern.Op == regexpsyntax.OpLiteral)
+		} else {
+			return nil, false
+		}
+	}
+	// now validate that each repo has specifies a revision explicitly
+	// is this needed?
+	return repos, validated
 }
 
 func resolveRepositories(ctx context.Context, op resolveRepoOp) (repoRevisions, missingRepoRevisions []*search.RepositoryRevisions, overLimit bool, err error) {
@@ -489,15 +536,15 @@ func resolveRepositories(ctx context.Context, op resolveRepoOp) (repoRevisions, 
 		}
 	}
 
-	// note that this mutates the strings in includePatterns, stripping their
-	// revision specs, if they had any.
-	includePatternRevs, err := findPatternRevs(includePatterns)
+	log15.Info("1.", "includePatterns", includePatterns)
+	strippedIncludePatterns, includePatternRevs, err := partitionPatternRevs(includePatterns)
+	log15.Info("2.", "includePatterns", includePatterns, "strippedIncludePatterns", strippedIncludePatterns, "includePatternRevs", includePatternRevs)
 	if err != nil {
 		return nil, nil, false, err
 	}
 
 	var defaultRepos []*types.Repo
-	if envvar.SourcegraphDotComMode() && len(includePatterns) == 0 {
+	if envvar.SourcegraphDotComMode() && len(strippedIncludePatterns) == 0 {
 		getIndexedRepos := func(ctx context.Context, revs []*search.RepositoryRevisions) (indexed, unindexed []*search.RepositoryRevisions, err error) {
 			return zoektIndexedRepos(ctx, search.Indexed(), revs, nil)
 		}
@@ -515,9 +562,17 @@ func resolveRepositories(ctx context.Context, op resolveRepoOp) (repoRevisions, 
 		}
 	} else {
 		tr.LazyPrintf("Repos.List - start")
+		includePatternsForLookup := strippedIncludePatterns // preserve existing behavior
+		log15.Info("3.", "includePatterns", includePatterns, "strippedIncludePatterns", strippedIncludePatterns, "includePatternRevs", includePatternRevs, "includePatternsForLookup", includePatternsForLookup)
+		if _, ok := parseMultiRepoSpec(includePatterns); ok {
+			log15.Info("A. Yes", "processed", "includePatterns")
+			includePatternsForLookup = stripAtRevspec(includePatterns) // override. could use partition function instead.
+			log15.Info("4.", "includePatterns", includePatterns, "strippedIncludePatterns", strippedIncludePatterns, "includePatternRevs", includePatternRevs, "includePatternsForLookup", includePatternsForLookup)
+
+		}
 		repos, err = db.Repos.List(ctx, db.ReposListOptions{
 			OnlyRepoIDs:     true,
-			IncludePatterns: includePatterns,
+			IncludePatterns: includePatternsForLookup,
 			ExcludePattern:  unionRegExps(excludePatterns),
 			// List N+1 repos so we can see if there are repos omitted due to our repo limit.
 			LimitOffset:  &db.LimitOffset{Limit: maxRepoListSize + 1},
@@ -531,6 +586,17 @@ func resolveRepositories(ctx context.Context, op resolveRepoOp) (repoRevisions, 
 			return nil, nil, false, err
 		}
 	}
+
+	if patterns, ok := parseMultiRepoSpec(includePatterns); ok {
+		log15.Info("B. Yes", "processed", "includePatterns", "includePatterns", includePatterns, "patterns", patterns)
+		_, includePatternRevs, err = partitionPatternRevs(patterns) // partition on multi repo spec instead.
+		log15.Info("5.", "new includePatternRevs", includePatternRevs)
+		if err != nil {
+			return nil, nil, false, err
+		}
+	}
+	log15.Info("6.", "includePatterns", includePatterns, "strippedIncludePatterns", strippedIncludePatterns, "includePatternRevs", includePatternRevs)
+
 	overLimit = len(repos) >= maxRepoListSize
 
 	repoRevisions = make([]*search.RepositoryRevisions, 0, len(repos))
